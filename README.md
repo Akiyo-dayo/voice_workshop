@@ -30,9 +30,12 @@ NA 插件管理中添加仓库：`https://github.com/Akiyo-dayo/akiyo_tts`
 
 ### 怎么找角色音色模型 ID
 
-1. 打开 <https://fish.audio/zh/models>，选一个模型（如某动漫角色音）
-2. 模型页 URL 形如 `https://fish.audio/zh/models/abcd1234...`，末段即 `reference_id`
+1. 打开 <https://fish.audio/zh/models> 搜索角色名（如「鸣潮」「芙宁娜」），或直接用接口：
+   `https://api.fish.audio/model?page_number=1&page_size=20&title=<关键词>`
+2. 选中模型的 `_id` 即 `reference_id`
 3. 群内发 `/tts_set_voice <ID>`，或填进配置 `DEFAULT_REFERENCE_ID`
+
+> 已实测可用：鸣潮-漂泊者 `51a1f823b33b4bdb9440222a30f31748`、鸣潮散华 `3de2b456b20e43ee970b3c4fe102632d`（免费模型 + reference_id 出音正常）
 
 ## 命令
 
