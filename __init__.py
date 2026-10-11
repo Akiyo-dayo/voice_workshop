@@ -1,17 +1,26 @@
-"""akiyo_tts - 外部角色语音 TTS 插件
+"""voice_workshop - 声色工坊
 
-调用云端 TTS API（默认 FishAudio）合成语音，经 OneBot 以语音消息发出，
-替代 QQ 协议端自带 TTS。支持 FishAudio 社区训练的角色音色模型（reference_id），
-也预留了 MiMo / 百炼等 OpenAI 兼容接口的扩展位。
+调用云端 Fish Audio 合成角色语音，经 OneBot 以语音消息发出，
+支持群聊和私聊，并将发送记录同步到 NekroAgent 历史。
 
-仓库: https://github.com/Akiyo-dayo/akiyo_tts
+仓库: https://github.com/Akiyo-dayo/voice_workshop
 """
 
 import asyncio
 import base64
 import os
+import sys
 import tempfile
 import time
+from pathlib import Path
+from types import SimpleNamespace
+
+# XYJ's upstream image does not ship third-party plugin dependencies.  Keep
+# the dependency in the persistent plugin data directory and prefer it when
+# available; normal installations continue to use the system package.
+_vendor_dir = Path(__file__).with_name("vendor")
+if _vendor_dir.is_dir():
+    sys.path.insert(0, str(_vendor_dir))
 
 import requests
 from nonebot import on_command, get_bot
@@ -24,6 +33,8 @@ from pydantic import Field
 from nekro_agent.adapters.onebot_v11.matchers.command import command_guard
 from nekro_agent.api.schemas import AgentCtx
 from nekro_agent.core import logger
+from nekro_agent.schemas.agent_message import AgentMessageSegment, AgentMessageSegmentType
+from nekro_agent.services.message_service import message_service
 from nekro_agent.services.plugin.base import (
     ConfigBase,
     NekroPlugin,
@@ -32,12 +43,12 @@ from nekro_agent.services.plugin.base import (
 from nekro_agent.services.plugin.manager import save_plugin_config
 
 plugin = NekroPlugin(
-    name="外部角色语音 TTS",
-    module_name="akiyo_tts",
+    name="声色工坊",
+    module_name="voice_workshop",
     description="调用 FishAudio 等外部 TTS 服务合成角色语音并发送到聊天，支持社区训练音色模型",
-    version="1.0.0",
-    author="Akiyo-dayo",
-    url="https://github.com/Akiyo-dayo/akiyo_tts",
+    version="1.1.0",
+    author="Akiyo_dayo",
+    url="https://github.com/Akiyo-dayo/voice_workshop",
 )
 
 
@@ -46,9 +57,9 @@ class TTSConfig(ConfigBase):
     """语音合成配置"""
 
     API_BASE: str = Field(
-        default="https://api.fish.audio/v1",
+        default="https://fishaudio.org/api/open/v1",
         title="API Base URL",
-        description="TTS 服务的 API 基础地址。FishAudio: https://api.fish.audio/v1",
+        description="Fish Audio Open API 基础地址：https://fishaudio.org/api/open/v1",
     )
     API_KEY: str = Field(
         default="",
@@ -61,17 +72,16 @@ class TTSConfig(ConfigBase):
         description="fishaudio（REST）/ openai_compatible（MiMo、百炼等 OpenAI 兼容接口，预留）",
     )
     DEFAULT_MODEL: str = Field(
-        default="s2.1-pro",
+        default="fishaudio-s21pro-flash",
         title="默认模型",
-        description="默认 TTS 模型。FishAudio 可选 s2.1-pro（付费）/ s2.1-pro-free（免费 fair-use）",
+        description="默认 TTS 模型。Fish Audio Open API v1 可用 fishaudio-s21pro-flash 等模型",
     )
     DEFAULT_REFERENCE_ID: str = Field(
         default="",
-        title="默认角色音色模型 ID",
+        title="默认角色音色 UUID",
         description=(
-            "FishAudio 社区训练的角色音色模型 ID（reference_id），"
-            "在 https://fish.audio/zh/models 打开任意模型页，URL 末段即 ID。"
-            "留空则使用基础音色合成"
+            "Fish Audio 角色音色 UUID，直接取音色页面 URL 的 voiceId 参数；"
+            "例如 voiceId=0c8b9dbf-932a-48c3-845a-109cfe5beffd。留空则使用服务默认音色"
         ),
     )
     PROXY: str = Field(
@@ -104,7 +114,7 @@ def _http_kwargs() -> dict:
 
 
 def _fish_audio_tts(text: str, model: str, reference_id: str) -> bytes:
-    """调用 FishAudio /v1/tts，返回音频字节"""
+    """调用 FishAudio Open API /speech/tts，返回音频字节"""
     headers = {
         "Authorization": f"Bearer {config.API_KEY}",
         "Content-Type": "application/json",
@@ -112,14 +122,18 @@ def _fish_audio_tts(text: str, model: str, reference_id: str) -> bytes:
     }
     payload: dict = {
         "text": text,
+        "modelId": model,
         "format": "mp3",
-        "model": model,
+        "speed": 1,
+        "volume": 0,
+        "stability": 1,
+        "similarity": 1,
     }
     if reference_id:
-        payload["reference_id"] = reference_id
+        payload["voiceId"] = reference_id
 
     resp = requests.post(
-        f"{config.API_BASE.rstrip('/')}/tts",
+        f"{config.API_BASE.rstrip('/')}/speech/tts",
         headers=headers,
         json=payload,
         **_http_kwargs(),
@@ -141,29 +155,59 @@ def _openai_compatible_tts(text: str, model: str, voice: str) -> bytes:
     )
 
 
-async def _send_audio(chat_key: str, audio: bytes) -> None:
+async def _send_audio(chat_key: str, audio: bytes, text: str = "") -> None:
     """经 OneBot 发送语音消息"""
-    pairs = chat_key.split("_")
-    chat_type = pairs[0]
-    chat_id = pairs[2]
+    chat_type, separator, chat_id = chat_key.rpartition("_")
+    if not separator or not chat_id:
+        raise ValueError(f"无法解析聊天标识: {chat_key}")
     bot = get_bot()
 
     tmp_path: str = ""
     try:
-        # OneBot record 段支持 base64 / 本地路径 / URL，优先 base64
-        try:
-            b64 = base64.b64encode(audio).decode()
-            segment = MessageSegment.record(file=f"base64://{b64}")
-        except Exception:
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-                f.write(audio)
-                tmp_path = f.name
-            segment = MessageSegment.record(file=tmp_path)
+        # Use a local MP3 path so OneBot can send it and NA can copy the same
+        # file into its persistent uploads/history store.
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            f.write(audio)
+            tmp_path = f.name
+        segment = MessageSegment.record(file=tmp_path)
 
         if chat_type == "onebot_v11-group":
-            await bot.send_group_msg(group_id=int(chat_id), message=segment)
+            logger.info("[akiyo_tts] 正在发送 OneBot 群语音 chat_id=%s bytes=%d", chat_id, len(audio))
+            response = await bot.send_group_msg(group_id=int(chat_id), message=segment)
         else:
-            await bot.send_private_msg(user_id=int(chat_id), message=segment)
+            logger.info("[akiyo_tts] 正在发送 OneBot 私聊语音 user_id=%s bytes=%d", chat_id, len(audio))
+            try:
+                response = await bot.send_private_msg(user_id=int(chat_id), message=segment)
+            except Exception as local_error:
+                # Some NapCat versions cannot read the agent's temporary path.
+                # Retry with a base64 record segment before failing the tool.
+                logger.warning("[akiyo_tts] 本地音频路径发送失败，改用 base64 重试: %s", local_error)
+                b64 = base64.b64encode(audio).decode()
+                response = await bot.send_private_msg(
+                    user_id=int(chat_id),
+                    message=MessageSegment.record(file=f"base64://{b64}"),
+                )
+        logger.info(
+            "[akiyo_tts] OneBot 语音发送成功 chat_key=%s response=%s",
+            chat_key,
+            response,
+        )
+
+        # lightweight file record so NA WebUI/history can show the event.
+        try:
+            response_id = getattr(response, "message_id", "")
+            if isinstance(response, dict):
+                response_id = response.get("message_id", "")
+            await message_service.push_bot_message(
+                chat_key,
+                [
+                    AgentMessageSegment(type=AgentMessageSegmentType.TEXT, content=f"🔊 语音：{text}"),
+                    AgentMessageSegment(type=AgentMessageSegmentType.FILE, content=tmp_path),
+                ],
+                SimpleNamespace(message_id=str(response_id or "")),
+            )
+        except Exception:
+            logger.exception("[akiyo_tts] 语音已发送，但写入 NA 消息历史失败")
     except Exception as e:
         raise RuntimeError(f"发送语音消息失败: {e}")
     finally:
@@ -176,11 +220,11 @@ async def _send_audio(chat_key: str, audio: bytes) -> None:
 
 @plugin.mount_sandbox_method(
     SandboxMethodType.TOOL,
-    name="发送角色语音",
+    name="FishAudio发送角色语音",
     description=(
-        "将一段文本用角色语音合成并直接发送到当前聊天（以语音条形式发出）。"
-        "当用户要求用角色/指定声音说话、读一段话、或需要发语音时使用。"
-        "调用后语音会自动发出，无需其他操作。"
+        "使用 FishAudio 云端角色音色合成并发送语音消息。群聊和私聊均支持，当前聊天会自动作为发送目标。"
+        "必须在用户明确要求语音时调用；不要改用 NekroAgent 内置的‘发送消息语音’工具。"
+        "调用后语音会自动发出，无需再发送文字替代。"
     ),
 )
 async def akiyo_tts(_ctx: AgentCtx, content: str) -> str:
@@ -223,7 +267,7 @@ async def akiyo_tts(_ctx: AgentCtx, content: str) -> str:
         audio = _openai_compatible_tts(text, config.DEFAULT_MODEL, config.DEFAULT_REFERENCE_ID)
 
     logger.info(f"[akiyo_tts] 合成完成，音频 {len(audio)} 字节")
-    await _send_audio(_ctx.from_chat_key, audio)
+    await _send_audio(_ctx.from_chat_key, audio, text)
     return f"已发送角色语音（{len(text)} 字符，{len(audio)} 字节音频）"
 
 
@@ -238,7 +282,7 @@ async def tts_set_model(matcher: Matcher, event: MessageEvent, bot: Bot, arg: Me
     username, cmd_content, chat_key, chat_type = await command_guard(event, bot, arg, matcher)
     if not cmd_content:
         await matcher.finish(message="用法: /tts_set_model <模型名>\n例: /tts_set_model s2.1-pro-free")
-    await save_plugin_config("Akiyo_dayo.akiyo_tts", {"DEFAULT_MODEL": cmd_content.strip()})
+    await save_plugin_config("Akiyo_dayo.voice_workshop", {"DEFAULT_MODEL": cmd_content.strip()})
     await matcher.finish(message=f"已切换 TTS 模型为: {cmd_content.strip()}")
 
 
@@ -250,7 +294,7 @@ async def tts_set_voice(matcher: Matcher, event: MessageEvent, bot: Bot, arg: Me
     voice = cmd_content.strip()
     if voice.lower() in ("none", "clear", "清空", ""):
         voice = ""
-    await save_plugin_config("Akiyo_dayo.akiyo_tts", {"DEFAULT_REFERENCE_ID": voice})
+    await save_plugin_config("Akiyo_dayo.voice_workshop", {"DEFAULT_REFERENCE_ID": voice})
     label = voice if voice else "（基础音色）"
     await matcher.finish(message=f"已切换角色音色为: {label}")
 
@@ -259,7 +303,7 @@ async def tts_set_voice(matcher: Matcher, event: MessageEvent, bot: Bot, arg: Me
 async def tts_status(matcher: Matcher, event: MessageEvent, bot: Bot, arg: Message = CommandArg()):
     await matcher.finish(
         message=(
-            "akiyo_tts 当前配置:\n"
+            "voice_workshop 当前配置:\n"
             f"- 提供商: {config.PROVIDER}\n"
             f"- 模型: {config.DEFAULT_MODEL}\n"
             f"- 角色音色: {config.DEFAULT_REFERENCE_ID or '（基础音色）'}\n"
