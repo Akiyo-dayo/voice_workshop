@@ -60,3 +60,37 @@ def test_wav_validation():
     assert plugin.validate_wav(b.getvalue())==1
     with pytest.raises(ValueError): plugin.validate_wav(b.getvalue()[:-1])
     with pytest.raises(ValueError): plugin.validate_wav(b'not wav')
+
+
+@pytest.mark.parametrize('width',[1,2,3])
+def test_tail_guard_preserves_all_pcm_and_adds_silence(width):
+    b=io.BytesIO()
+    pcm=(b'\x90' if width==1 else bytes([12])*width)*1000
+    with wave.open(b,'wb') as w:
+        w.setnchannels(1);w.setsampwidth(width);w.setframerate(1000);w.writeframes(pcm)
+    padded=plugin.pad_wav_tail(b.getvalue(),1)
+    assert plugin.validate_wav(padded)==2
+    with wave.open(io.BytesIO(padded),'rb') as r:
+        result=r.readframes(r.getnframes())
+    assert result[:len(pcm)]==pcm
+    assert result[len(pcm):]==(b'\x80' if width==1 else bytes(width))*1000
+
+
+def test_streaming_wav_header_normalization():
+    import struct
+    b=io.BytesIO()
+    with wave.open(b,'wb') as w:
+        w.setnchannels(1);w.setsampwidth(2);w.setframerate(1000);w.writeframes(bytes(2000))
+    raw=bytearray(b.getvalue())
+    struct.pack_into('<I',raw,4,0xffffff24)
+    struct.pack_into('<I',raw,40,0xffffff00)
+    fixed=plugin.normalize_wav(bytes(raw))
+    assert plugin.validate_wav(fixed)==1
+    assert fixed[44:]==bytes(2000)
+
+
+def test_tail_guard_effective_format():
+    plugin.config.TAIL_SILENCE_SECONDS=1
+    assert plugin._output_format()=='wav'
+    plugin.config.TAIL_SILENCE_SECONDS=0
+    assert plugin._output_format()=='mp3'

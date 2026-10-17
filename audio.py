@@ -1,6 +1,24 @@
 """Audio integrity checks; validate transport/frames, not spoken completeness."""
 
 
+def normalize_wav(data: bytes) -> bytes:
+    """Finalize common streaming RIFF/data size sentinels after HTTP completion."""
+    import struct
+    if len(data)<44 or data[:4]!=b'RIFF' or data[8:12]!=b'WAVE':
+        raise ValueError('无效WAV文件')
+    result=bytearray(data)
+    size=struct.unpack_from('<I',result,4)[0]
+    if size >= 0xffffff00 or size == 0: struct.pack_into('<I',result,4,len(result)-8)
+    pos=12
+    while pos+8<=len(result):
+        n=struct.unpack_from('<I',result,pos+4)[0]
+        if result[pos:pos+4]==b'data':
+            if n >= 0xffffff00 or n == 0: struct.pack_into('<I',result,pos+4,len(result)-pos-8)
+            break
+        pos+=8+n+(n&1)
+    return bytes(result)
+
+
 def validate_wav(data: bytes) -> float:
     import io
     import wave
@@ -16,6 +34,27 @@ def validate_wav(data: bytes) -> float:
             raise ValueError('WAV采样数据不完整')
         return frames/f.getframerate()
 
+
+
+def pad_wav_tail(data: bytes, seconds: float) -> bytes:
+    """Preserve PCM samples and append silence for QQ playback tail protection."""
+    import io
+    import math
+    import wave
+    if not math.isfinite(seconds) or not 0 <= seconds <= 3:
+        raise ValueError('尾部静音必须为0–3秒')
+    validate_wav(data)
+    with wave.open(io.BytesIO(data), 'rb') as src:
+        params = src.getparams()
+        pcm = src.readframes(src.getnframes())
+        count = math.ceil(seconds * src.getframerate()) * src.getnchannels()
+        # PCM8 is unsigned; wider PCM uses signed zero.
+        silence = (b'\x80' if src.getsampwidth() == 1 else bytes(src.getsampwidth())) * count
+    out = io.BytesIO()
+    with wave.open(out, 'wb') as dst:
+        dst.setparams(params)
+        dst.writeframes(pcm + silence)
+    return out.getvalue()
 
 
 def validate_mp3(data: bytes) -> float:

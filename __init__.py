@@ -28,7 +28,7 @@ from urllib.parse import parse_qs, urlparse
 
 import httpx
 
-from .audio import validate_mp3, validate_wav
+from .audio import validate_mp3, validate_wav, pad_wav_tail, normalize_wav
 from .acting import EMOTIONS, DELIVERIES, PRESETS, acting_payload
 from nonebot import on_command, get_bot
 from nonebot.adapters import Bot, Message
@@ -53,7 +53,7 @@ plugin = NekroPlugin(
     name="声色工坊",
     module_name="voice_workshop",
     description="调用 FishAudio 等外部 TTS 服务合成角色语音并发送到聊天，支持社区训练音色模型",
-    version="1.3.0",
+    version="1.3.1",
     author="Akiyo_dayo",
     url="https://github.com/Akiyo-dayo/voice_workshop",
 )
@@ -119,6 +119,7 @@ class TTSConfig(ConfigBase):
     ALLOWED_EMOTIONS: str = Field(default=",".join(EMOTIONS), title="Agent允许情绪", description="英文名称逗号分隔；只是许可，仍需模型支持")
     ALLOWED_DELIVERIES: str = Field(default=",".join(DELIVERIES), title="Agent允许发声方式", description="英文名称逗号分隔")
     ALLOW_EXPERIMENTAL_ACTING: bool = Field(default=False, title="允许实验性Fish标签", description="愤怒/悲伤/哭腔等可尝试但不保证生效，默认关闭；接口成功不等于听感确认")
+    TAIL_SILENCE_SECONDS: float = Field(default=1, ge=0, le=3, title="QQ尾音保护静音（秒）", description="默认在PCM WAV末尾补1秒静音，避免QQ收音过早；设0关闭。开启时服务请求WAV，不改变台词或音色")
     OUTPUT_FORMAT: str = Field(default="mp3", title="输出格式", description="mp3或wav，需模型支持；Qwen3仅wav")
     ROLE_GUIDANCE: str = Field(default="保持当前角色人设，像自然对话而非播报；使用完整口语句子，通过标点表达停顿，结合上下文选择克制的情绪，确保最后一句说完。", title="角色演绎引导", description="注入给 Agent 的写作与演绎指导，不作为台词朗读，也不冒充服务支持的 instruction 参数")
     ALLOW_AGENT_OVERRIDES: bool = Field(default=True, title="允许 Agent 单次调音", description="允许工具参数覆盖语速/音量/稳定度/相似度/语言/风格；不会修改实例默认或更换模型音色")
@@ -211,6 +212,10 @@ def _options(speed=None, volume=None, stability=None, similarity=None, language=
     return values
 
 
+def _output_format():
+    return 'wav' if config.TAIL_SILENCE_SECONDS > 0 else config.OUTPUT_FORMAT
+
+
 async def _model_capabilities(client):
     if not config.API_BASE.rstrip('/').endswith('/v3'):
         if not config.DEFAULT_MODEL.startswith('fishaudio-'):
@@ -221,7 +226,7 @@ async def _model_capabilities(client):
     model=next((m for m in response.json()['models'] if m['id']==config.DEFAULT_MODEL),None)
     if not model or not model.get('available'):
         raise ValueError('模型不可用，请查询当前能力目录')
-    if config.OUTPUT_FORMAT not in model['outputFormats']:
+    if _output_format() not in model['outputFormats']:
         raise ValueError('模型不支持所选输出格式')
     response=await client.get(f"{config.API_BASE.rstrip('/')}/voices/{config.DEFAULT_REFERENCE_ID}")
     response.raise_for_status()
@@ -238,7 +243,7 @@ async def _fish_audio_tts(client: httpx.AsyncClient, text: str, options: dict) -
         raise ValueError('管理员已关闭Fish标签，请使用neutral/normal')
     if config.OUTPUT_FORMAT not in ('mp3','wav'):
         raise ValueError('输出格式须为mp3或wav')
-    payload = {**acting, 'modelId':config.DEFAULT_MODEL,'format':config.OUTPUT_FORMAT}
+    payload = {**acting, 'modelId':config.DEFAULT_MODEL,'format':_output_format()}
     for key in ('speed','volume','stability','similarity','language'):
         if controls is not None and not controls.get(key):
             if key in options.get('_explicit',set()):
@@ -253,7 +258,7 @@ async def _fish_audio_tts(client: httpx.AsyncClient, text: str, options: dict) -
             # Do not log response bodies which can contain credentials or text.
             raise RuntimeError(f"FishAudio API 返回 HTTP {resp.status_code}；未自动重试，请检查服务/额度")
         content_type = resp.headers.get("content-type", "").split(";", 1)[0].lower()
-        allowed_types=('audio/mpeg','audio/mp3','application/octet-stream') if config.OUTPUT_FORMAT=='mp3' else ('audio/wav','audio/x-wav','audio/wave','application/octet-stream')
+        allowed_types=('audio/mpeg','audio/mp3','application/octet-stream') if _output_format()=='mp3' else ('audio/wav','audio/x-wav','audio/wave','application/octet-stream')
         if content_type not in allowed_types:
             raise RuntimeError(f"FishAudio 返回非预期音频响应（{content_type}）")
         audio = bytearray()
@@ -268,7 +273,11 @@ async def _fish_audio_tts(client: httpx.AsyncClient, text: str, options: dict) -
         if ignored:
             raise RuntimeError(f"服务忽略了请求参数 {ignored[:150]}，请调整配置；本次未发送音频")
     result = bytes(audio)
-    duration = validate_mp3(result) if config.OUTPUT_FORMAT=='mp3' else validate_wav(result)
+    if _output_format()=='wav': result=normalize_wav(result)
+    duration = validate_mp3(result) if _output_format()=='mp3' else validate_wav(result)
+    if config.TAIL_SILENCE_SECONDS > 0:
+        result = pad_wav_tail(result, config.TAIL_SILENCE_SECONDS)
+        logger.info(f'[akiyo_tts] QQ尾音保护 已补{config.TAIL_SILENCE_SECONDS}s静音')
     logger.info(f"[akiyo_tts] 音频校验完成 chars={len(text)} bytes={len(result)} duration={duration:.2f}s")
     return result
 
@@ -285,7 +294,7 @@ async def _send_audio(chat_key: str, audio: bytes, text: str = "") -> None:
     try:
         # Use a local MP3 path so OneBot can send it and NA can copy the same
         # file into its persistent uploads/history store.
-        with tempfile.NamedTemporaryFile(suffix='.'+config.OUTPUT_FORMAT, delete=False) as f:
+        with tempfile.NamedTemporaryFile(suffix='.'+_output_format(), delete=False) as f:
             f.write(audio)
             tmp_path = f.name
         segment = MessageSegment.record(file=tmp_path)
@@ -468,7 +477,7 @@ async def tts_set_model(matcher: Matcher, event: MessageEvent, bot: Bot, arg: Me
                 r.raise_for_status()
                 candidate=next((x for x in r.json()['models'] if x['id']==selected and x.get('available')),None)
                 if not candidate: raise ValueError('模型不存在或当前不可用')
-                if config.OUTPUT_FORMAT not in candidate['outputFormats']: raise ValueError('请先设置模型支持的输出格式')
+                if _output_format() not in candidate['outputFormats']: raise ValueError('请先设置模型支持的输出格式')
                 r=await client.get(origin+'/api/open/v3/voices/'+config.DEFAULT_REFERENCE_ID)
                 r.raise_for_status()
                 if selected not in r.json().get('voice',{}).get('modelIds',[]): raise ValueError('当前音色与目标模型不兼容')

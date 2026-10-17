@@ -77,7 +77,7 @@ REAL_SEND = plugin._send_audio
 
 @pytest.fixture(autouse=True)
 def reset(monkeypatch):
-    monkeypatch.setattr(plugin, 'config', plugin.TTSConfig(API_KEY='test', COOLDOWN_SECONDS=0, SPLIT_SENTENCES=False))
+    monkeypatch.setattr(plugin, 'config', plugin.TTSConfig(API_KEY='test', COOLDOWN_SECONDS=0, SPLIT_SENTENCES=False, TAIL_SILENCE_SECONDS=0))
     monkeypatch.setattr(plugin, '_call_lock', asyncio.Lock())
     monkeypatch.setattr(plugin, '_last_call', 0.0)
     monkeypatch.setattr(plugin, '_send_audio', AsyncMock())
